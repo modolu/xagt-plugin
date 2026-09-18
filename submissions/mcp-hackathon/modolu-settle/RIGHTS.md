@@ -2,7 +2,7 @@
 
 Project: `Settle`
 Submission slug: `modolu-settle`
-Submitter: `modolu (GitHub account modolu, heritage143@gmail.com)`
+Submitter: `modolu (individual builder; GitHub account modolu, heritage143@gmail.com)`
 Date: `2026-09-18`
 
 The submitter confirms that they own, or have sufficient authorization for, the source code, dependencies, service, data, branding, and other materials submitted in this pull request.

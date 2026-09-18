@@ -125,4 +125,67 @@ curl --silent https://settle-beige-seven.vercel.app/v1/payment-intents/pi_AAAAAA
 
 ## 4. Real payment evidence
 
-**PENDING.** This section is completed before the final submission with a fresh intent created through this deployment, one real native Base USDC transfer sent from the declared payer to the recipient outside Settle (Settle never signs or sends transactions), the reconcile responses showing the `detected` → `paid` transition, the `GET …/evidence` response with the real transaction hash, block number, confirmations and block timestamp, and a Basescan link for the transaction. No such transfer has been recorded here yet; nothing in this file should be read as a claim that one has.
+A real native Base USDC payment was reconciled through this exact deployment (review commit `25e958fcecaeb4ad20760c5a94c93a4670fd2b77`, origin `https://settle-beige-seven.vercel.app`) on 2026-09-18. The payment was sent by the submitter from their own wallet, outside Settle; Settle never signs or sends transactions. Wallet addresses and the transaction hash below are public blockchain data.
+
+- Intent ID: `pi_T21YOW3UagzGPvC0_2CMttKpZyMU0Qv-`
+- External reference: `XAGENT-REAL-PROOF-20260918`
+- Transaction: `0xe65d8e633386483953b904920075fe6133d8cee425f6c924826494086e84cd30` — https://basescan.org/tx/0xe65d8e633386483953b904920075fe6133d8cee425f6c924826494086e84cd30
+
+### 4a. Intent creation (before the payment)
+
+```bash
+curl --fail --silent --show-error \
+  --request POST https://settle-beige-seven.vercel.app/v1/payment-intents \
+  --header "content-type: application/json" \
+  --data '{"externalReference":"XAGENT-REAL-PROOF-20260918","chain":"base","asset":"USDC","amount":"0.10","recipient":"0x4d9247a33D713e05860E0f098bc2e45b2329e652","payer":"0x389b48BE5385B4d4F1c14FbacE6947695Bcfdf57","expiresAt":"2026-09-18T16:30:40Z","requiredConfirmations":3}'
+```
+
+Response `201 Created` (`X-Request-Id: req_taMh6cdi5xFQ9v2ITTUH3A`):
+
+```json
+{"id":"pi_T21YOW3UagzGPvC0_2CMttKpZyMU0Qv-","status":"pending","externalReference":"XAGENT-REAL-PROOF-20260918","chain":"base","asset":"USDC","expectedAmount":"0.10","receivedAmount":"0.00","remainingAmount":"0.10","recipient":"0x4d9247a33D713e05860E0f098bc2e45b2329e652","payer":"0x389b48BE5385B4d4F1c14FbacE6947695Bcfdf57","requiredConfirmations":3,"matchConfidence":"none","paidAt":null,"createdAt":"2026-09-18T14:30:43.132Z","expiresAt":"2026-09-18T16:30:40.000Z"}
+```
+
+### 4b. The payment
+
+After the intent existed, the payer wallet sent exactly 0.10 native Circle USDC (contract `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`) on Base mainnet to the recipient. It was mined in block `51476801` at `2026-09-18T14:49:09Z`.
+
+### 4c. Reconciliation
+
+```bash
+curl --fail --silent --show-error --request POST \
+  https://settle-beige-seven.vercel.app/v1/payment-intents/pi_T21YOW3UagzGPvC0_2CMttKpZyMU0Qv-/reconcile
+```
+
+The first reconciliation ran at `2026-09-18T14:52:17Z` (`X-Request-Id: req_ZzdHt5XA03OrhWThvNsZ2Q`). By then the transfer already had far more than the 3 required confirmations, so no intermediate `detected` state was observed; the response was directly `200`:
+
+```json
+{"id":"pi_T21YOW3UagzGPvC0_2CMttKpZyMU0Qv-","status":"paid","externalReference":"XAGENT-REAL-PROOF-20260918","chain":"base","asset":"USDC","expectedAmount":"0.10","receivedAmount":"0.10","remainingAmount":"0.00","recipient":"0x4d9247a33D713e05860E0f098bc2e45b2329e652","payer":"0x389b48BE5385B4d4F1c14FbacE6947695Bcfdf57","requiredConfirmations":3,"matchConfidence":"exact_payer","paidAt":"2026-09-18T14:49:09.000Z","createdAt":"2026-09-18T14:30:43.132Z","expiresAt":"2026-09-18T16:30:40.000Z"}
+```
+
+`paidAt` is the block timestamp of the transfer that satisfied the obligation, not the reconciliation time. A second `POST …/reconcile` returned the identical state with one evidence row (idempotent).
+
+### 4d. Persisted state and evidence
+
+```bash
+curl --fail --silent --show-error https://settle-beige-seven.vercel.app/v1/payment-intents/pi_T21YOW3UagzGPvC0_2CMttKpZyMU0Qv-
+curl --fail --silent --show-error https://settle-beige-seven.vercel.app/v1/payment-intents/pi_T21YOW3UagzGPvC0_2CMttKpZyMU0Qv-/evidence
+```
+
+`GET …/evidence` (`X-Request-Id: req_ldfi93wgEKRuIwenELfVIg`), `200`:
+
+```json
+{"evidence":[{"transactionHash":"0xe65d8e633386483953b904920075fe6133d8cee425f6c924826494086e84cd30","logIndex":125,"blockNumber":"51476801","from":"0x389b48BE5385B4d4F1c14FbacE6947695Bcfdf57","to":"0x4d9247a33D713e05860E0f098bc2e45b2329e652","amount":"0.10","confirmations":96,"blockTimestamp":"2026-09-18T14:49:09.000Z","association":"matched"}],"nextCursor":null}
+```
+
+`confirmations` is the depth observed at that reconciliation (`latest − 51476801 + 1`); a later reconcile reports a larger value. These endpoints remain publicly readable for this intent.
+
+### 4e. Independent verification
+
+Checked against Base mainnet through a public RPC that is not Settle's provider, and on BaseScan:
+
+- network: Base mainnet (chain id 8453); transaction status: `success`
+- block `51476801`, hash `0xeebfddf04a7bdbfbcdeda2c3a1561b840305124d1f42724de1c38e944bc7dac8`, timestamp `2026-09-18T14:49:09Z`
+- exactly one `Transfer` log from contract `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` (native Circle USDC), log index `125`, from `0x389b48BE5385B4d4F1c14FbacE6947695Bcfdf57` to `0x4d9247a33D713e05860E0f098bc2e45b2329e652`, value `100000` base units = `0.10` USDC
+
+Every field of Settle's evidence row (hash, log index, block, sender, recipient, amount, block timestamp) matches the chain.
