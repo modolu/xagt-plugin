@@ -337,17 +337,22 @@ On reconciliation:
 - never inspect transfers mined after the expiry boundary;
 - `ChainProvider` owns any block lookup/binary-search mechanics.
 
-### 7.2 Log filter
+### 7.2 Transfer discovery and log verification
 
-The Alchemy adapter queries canonical ERC-20 `Transfer(address,address,uint256)` logs from the native Base USDC contract.
+The Alchemy adapter discovers candidate transactions with the Alchemy Transfers API (`alchemy_getAssetTransfers`), which performs filtered historical transfer discovery over the whole window in one paginated query, and then verifies every discovered transaction from its canonical EVM transaction receipt, decoding the native Base USDC `Transfer(address,address,uint256)` logs with `viem`. Only receipt/log data becomes evidence; the Transfers API's human-readable values are never used for money.
 
-Always filter by:
+Discovery always filters by:
 
 - token contract;
 - `to = recipient`;
-- block range.
+- block range;
+- `category = erc20`.
 
-When `payer` exists, also filter by indexed `from = payer` at RPC level.
+When `payer` exists, also filter by `from = payer` at the provider level.
+
+Verification re-applies the contract, recipient, payer (when declared) and block-range filters to the decoded logs, keeps every matching log of a transaction (identity is `tx_hash + log_index`), and fails the whole operation on any discovery, pagination, receipt or decoding failure — a partial scan is never returned.
+
+The design remains compatible with Alchemy Free's 10-block `eth_getLogs` restriction because reconciliation no longer relies on wide-range `eth_getLogs` queries.
 
 The reconciliation engine never imports Alchemy-specific response types.
 
@@ -841,7 +846,7 @@ The exact X-Agent verification JSON schema must come from the official hackathon
 | No `intent_secret` in required v1 | Extra secret handling is useful but not required to demonstrate reconciliation. | Leaving it “optional” for agents to implement inconsistently. |
 | Base + native USDC only | Product brief intentionally fixes one rail and removes FX/token ambiguity. | Multi-chain/asset abstractions exposed to callers. |
 | Alchemy behind `ChainProvider` | Provider choice must not leak into reconciliation logic. | Direct Alchemy calls from services; second provider in v1. |
-| On-demand `eth_getLogs` | Caller-triggered reconciliation matches MVP scope and avoids chain infrastructure. | Indexer DB; WebSocket listener; cron scanner. |
+| On-demand transfer discovery + receipt verification | Caller-triggered reconciliation matches MVP scope and avoids chain infrastructure. Alchemy Transfers API discovers candidates; canonical receipts provide exact evidence; independent of the plan's `eth_getLogs` block-range limit. | Indexer DB; WebSocket listener; cron scanner; wide-range `eth_getLogs` (fails on Alchemy Free beyond 10 blocks); tiny-range `eth_getLogs` chunking. |
 | `start_block = latest + 1` | Prevents pre-intent transfers from satisfying a newly created obligation. | Scanning by timestamp alone. |
 | Exact integer token units | Payment correctness cannot depend on binary floating point. | `number`, floating SQL types. |
 | Conservative no-payer matching | Multiple plausible senders must not create false certainty. | Heuristic scoring or choosing the closest amount. |
@@ -968,7 +973,7 @@ Deliver:
 ### Assumptions
 
 - Production reconciliation uses Base **mainnet**, because the brief requires a real Base USDC demo.
-- The Alchemy deployment plan used for the demo permits practical multi-block Base `eth_getLogs` queries. Settle does not build thousands of tiny free-tier range requests.
+- The Alchemy deployment plan is Alchemy Free. Its `eth_getLogs` is limited to a 10-block range, so transfer discovery uses the Alchemy Transfers API and canonical transaction receipts instead (§7.2). Settle does not build thousands of tiny free-tier range requests.
 - The final hackathon slug is supplied through `XAGENT_SLUG`.
 - Anonymous intent IDs are acceptable as the v1 capability boundary; there is no public intent listing.
 - Automatic data-retention deletion is deferred because v1 has no worker/cron. The schema intentionally stores only payment metadata and public-chain evidence rather than personal data.

@@ -3,6 +3,14 @@
  * endpoint through viem. This is the only module that creates a viem RPC
  * client or knows the transport URL (ARCHITECTURE.md §6).
  *
+ * Transfer discovery uses Alchemy's `alchemy_getAssetTransfers` (filtered by
+ * contract, recipient and optional sender over the whole window, paginated),
+ * and every discovered transaction is then verified from its canonical
+ * receipt: the native USDC `Transfer` logs are decoded with viem and
+ * re-filtered, and only receipt/log data becomes evidence. The Transfers API
+ * is never trusted for amounts. This keeps reconciliation independent of the
+ * `eth_getLogs` block-range limit of the Alchemy plan (ARCHITECTURE.md §7.2).
+ *
  * The RPC URL embeds the provider credential. viem error messages can contain
  * that URL, so provider errors are never re-thrown or attached as `cause`;
  * only a redacted summary reaches the application error.
@@ -17,6 +25,8 @@ import {
   getAddress,
   http,
   isAddress,
+  parseEventLogs,
+  toEventSelector,
   type PublicClient,
 } from "viem";
 
@@ -27,7 +37,7 @@ import { BASE_CHAIN, ERC20_TRANSFER_EVENT_ABI, USDC_CONTRACT_ADDRESS } from "./b
 import { findLastBlockAtOrBefore } from "./block-search";
 
 /** The subset of a viem public client the provider uses; injectable for tests. */
-export type BaseRpcClient = Pick<PublicClient, "getBlockNumber" | "getLogs" | "getBlock">;
+export type BaseRpcClient = Pick<PublicClient, "getBlockNumber" | "getBlock" | "getTransactionReceipt" | "request">;
 
 export interface AlchemyBaseProviderOptions {
   readonly rpcUrl: string;
@@ -38,9 +48,15 @@ export interface AlchemyBaseProviderOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
-const TRANSFER_EVENT = ERC20_TRANSFER_EVENT_ABI[0];
 const USDC_CONTRACT_LOWERCASE = USDC_CONTRACT_ADDRESS.toLowerCase();
+const TRANSFER_TOPIC = toEventSelector(ERC20_TRANSFER_EVENT_ABI[0]).toLowerCase();
 const HASH_32 = /^0x[0-9a-f]{64}$/;
+/** Alchemy's documented per-page maximum for `alchemy_getAssetTransfers`. */
+const TRANSFERS_PAGE_SIZE = 1000;
+/** Safety cap on pagination so a misbehaving provider cannot loop forever. */
+const MAX_TRANSFER_PAGES = 1000;
+/** Receipts are fetched a few at a time: fast enough, gentle on provider rate limits. */
+const RECEIPT_CONCURRENCY = 4;
 
 /** Summary of a provider failure that is safe to log: never includes the URL or payloads. */
 export interface RedactedProviderError {
@@ -97,65 +113,118 @@ function invalidResponse(operation: string, reason: string): AppError {
   });
 }
 
-/**
- * Converts one decoded viem log into a `ChainTransfer`, verifying every field
- * the reconciliation engine relies on. The RPC filter already constrains
- * contract, `from` and `to`; this re-checks them so a misbehaving node can
- * never inject evidence.
- */
-function toChainTransfer(log: unknown, query: UsdcTransferQuery): ChainTransfer {
-  if (typeof log !== "object" || log === null) {
-    throw invalidResponse("getLogs", "log is not an object");
+/** One entry of an `alchemy_getAssetTransfers` page — only the hash is used, for discovery. */
+interface AssetTransfersPage {
+  readonly transfers: readonly { readonly hash?: unknown }[];
+  readonly pageKey?: unknown;
+}
+
+function parseAssetTransfersPage(result: unknown): AssetTransfersPage {
+  if (typeof result !== "object" || result === null) {
+    throw invalidResponse("alchemy_getAssetTransfers", "result is not an object");
   }
-  const candidate = log as {
-    address?: unknown;
-    args?: unknown;
+  const page = result as { transfers?: unknown; pageKey?: unknown };
+  if (!Array.isArray(page.transfers)) {
+    throw invalidResponse("alchemy_getAssetTransfers", "transfers is not an array");
+  }
+  if (page.pageKey !== undefined && page.pageKey !== null && typeof page.pageKey !== "string") {
+    throw invalidResponse("alchemy_getAssetTransfers", "pageKey malformed");
+  }
+  for (const transfer of page.transfers) {
+    if (typeof transfer !== "object" || transfer === null) {
+      throw invalidResponse("alchemy_getAssetTransfers", "transfer entry is not an object");
+    }
+  }
+  return page as AssetTransfersPage;
+}
+
+/**
+ * Converts the canonical USDC `Transfer` logs of one receipt into
+ * `ChainTransfer`s that match the query. Logs from other contracts, other
+ * recipients, or (when declared) other payers are ignored; anything that is
+ * present but malformed is an invalid provider response.
+ */
+function transfersFromReceipt(receipt: unknown, query: UsdcTransferQuery): ChainTransfer[] {
+  if (typeof receipt !== "object" || receipt === null) {
+    throw invalidResponse("getTransactionReceipt", "receipt is not an object");
+  }
+  const candidate = receipt as {
+    transactionHash?: unknown;
     blockNumber?: unknown;
     blockHash?: unknown;
-    transactionHash?: unknown;
-    logIndex?: unknown;
-    removed?: unknown;
+    status?: unknown;
+    logs?: unknown;
   };
-  if (typeof candidate.address !== "string" || candidate.address.toLowerCase() !== USDC_CONTRACT_LOWERCASE) {
-    throw invalidResponse("getLogs", "log emitted by an unexpected contract");
+  if (typeof candidate.transactionHash !== "string" || !HASH_32.test(candidate.transactionHash.toLowerCase())) {
+    throw invalidResponse("getTransactionReceipt", "receipt transaction hash malformed");
   }
-  if (candidate.removed === true) {
-    throw invalidResponse("getLogs", "log marked removed");
-  }
-  const args = (candidate.args ?? {}) as { from?: unknown; to?: unknown; value?: unknown };
-  if (typeof args.from !== "string" || !isAddress(args.from)) {
-    throw invalidResponse("getLogs", "log sender malformed");
-  }
-  if (query.payer !== null && args.from.toLowerCase() !== query.payer) {
-    throw invalidResponse("getLogs", "log sender does not match the payer filter");
-  }
-  if (typeof args.to !== "string" || !isAddress(args.to) || args.to.toLowerCase() !== query.recipient) {
-    throw invalidResponse("getLogs", "log recipient does not match the recipient filter");
-  }
-  if (typeof args.value !== "bigint" || args.value < 0n) {
-    throw invalidResponse("getLogs", "log value is not a non-negative integer");
-  }
-  if (typeof candidate.blockNumber !== "bigint" || candidate.blockNumber < query.fromBlock || candidate.blockNumber > query.toBlock) {
-    throw invalidResponse("getLogs", "log block number outside the requested range");
+  if (typeof candidate.blockNumber !== "bigint") {
+    throw invalidResponse("getTransactionReceipt", "receipt block number malformed");
   }
   if (typeof candidate.blockHash !== "string" || !HASH_32.test(candidate.blockHash.toLowerCase())) {
-    throw invalidResponse("getLogs", "log block hash malformed");
+    throw invalidResponse("getTransactionReceipt", "receipt block hash malformed");
   }
-  if (typeof candidate.transactionHash !== "string" || !HASH_32.test(candidate.transactionHash.toLowerCase())) {
-    throw invalidResponse("getLogs", "log transaction hash malformed");
+  if (!Array.isArray(candidate.logs)) {
+    throw invalidResponse("getTransactionReceipt", "receipt logs malformed");
   }
-  if (typeof candidate.logIndex !== "number" || !Number.isInteger(candidate.logIndex) || candidate.logIndex < 0) {
-    throw invalidResponse("getLogs", "log index malformed");
+  // A discovered transaction outside the window (reorg between calls) is simply not evidence for it.
+  if (candidate.blockNumber < query.fromBlock || candidate.blockNumber > query.toBlock) {
+    return [];
   }
-  return {
-    txHash: candidate.transactionHash.toLowerCase(),
-    logIndex: candidate.logIndex,
-    blockNumber: candidate.blockNumber,
-    blockHash: candidate.blockHash.toLowerCase(),
-    from: args.from.toLowerCase(),
-    to: args.to.toLowerCase(),
-    amountUnits: args.value,
-  };
+  if (candidate.status !== "success") {
+    return [];
+  }
+
+  // Only native-USDC `Transfer` logs matter; other USDC events (e.g. Approval) and other contracts are ignored.
+  const usdcLogs = candidate.logs.filter((log) => {
+    const { address, topics } = log as { address?: unknown; topics?: unknown };
+    const topic0 = Array.isArray(topics) && typeof topics[0] === "string" ? topics[0].toLowerCase() : null;
+    return typeof address === "string" && address.toLowerCase() === USDC_CONTRACT_LOWERCASE && topic0 === TRANSFER_TOPIC;
+  });
+
+  let decoded: readonly { args: unknown; logIndex: unknown; removed?: unknown }[];
+  try {
+    decoded = parseEventLogs({
+      abi: ERC20_TRANSFER_EVENT_ABI,
+      eventName: "Transfer",
+      logs: usdcLogs as Parameters<typeof parseEventLogs>[0]["logs"],
+      strict: true,
+    });
+  } catch {
+    throw invalidResponse("getTransactionReceipt", "USDC log could not be decoded");
+  }
+  // strict: true drops logs whose topics/data do not decode; every USDC log must decode.
+  if (decoded.length !== usdcLogs.length) {
+    throw invalidResponse("getTransactionReceipt", "USDC log could not be decoded");
+  }
+
+  const transfers: ChainTransfer[] = [];
+  for (const log of decoded) {
+    const { from, to, value } = (log.args ?? {}) as { from?: unknown; to?: unknown; value?: unknown };
+    if (typeof from !== "string" || !isAddress(from) || typeof to !== "string" || !isAddress(to) || typeof value !== "bigint" || value < 0n) {
+      throw invalidResponse("getTransactionReceipt", "decoded Transfer arguments malformed");
+    }
+    if (typeof log.logIndex !== "number" || !Number.isInteger(log.logIndex) || log.logIndex < 0) {
+      throw invalidResponse("getTransactionReceipt", "log index malformed");
+    }
+    if (log.removed === true) {
+      throw invalidResponse("getTransactionReceipt", "log marked removed");
+    }
+    const sender = from.toLowerCase();
+    if (to.toLowerCase() !== query.recipient || (query.payer !== null && sender !== query.payer)) {
+      continue;
+    }
+    transfers.push({
+      txHash: candidate.transactionHash.toLowerCase(),
+      logIndex: log.logIndex,
+      blockNumber: candidate.blockNumber,
+      blockHash: candidate.blockHash.toLowerCase(),
+      from: sender,
+      to: to.toLowerCase(),
+      amountUnits: value,
+    });
+  }
+  return transfers;
 }
 
 export function createAlchemyBaseProvider(options: AlchemyBaseProviderOptions): ChainProvider {
@@ -189,29 +258,80 @@ export function createAlchemyBaseProvider(options: AlchemyBaseProviderOptions): 
       if (query.fromBlock > query.toBlock || query.fromBlock < 0n) {
         throw new Error(`invalid block range ${query.fromBlock}..${query.toBlock}`);
       }
-      let logs: unknown;
-      try {
-        // eth_getLogs filtered server-side by contract, event signature and the indexed
-        // recipient (topics[2] = to) — plus the indexed sender (topics[1] = from) when a
-        // payer is declared — over exactly one block range, never truncated.
-        logs = await client.getLogs({
-          address: USDC_CONTRACT_ADDRESS,
-          event: TRANSFER_EVENT,
-          args:
-            query.payer === null
-              ? { to: getAddress(query.recipient) }
-              : { from: getAddress(query.payer), to: getAddress(query.recipient) },
-          fromBlock: query.fromBlock,
-          toBlock: query.toBlock,
-          strict: true,
-        });
-      } catch (error) {
-        throw toUpstreamError("getLogs", error);
+
+      // 1. Discovery: every USDC transfer to the recipient (from the payer, when declared)
+      //    in the window, paginated through pageKey. Only transaction hashes are kept.
+      const hashes = new Set<string>();
+      let pageKey: string | undefined;
+      for (let pages = 0; ; pages += 1) {
+        if (pages >= MAX_TRANSFER_PAGES) {
+          throw invalidResponse("alchemy_getAssetTransfers", "pagination did not terminate");
+        }
+        const params: Record<string, unknown> = {
+          fromBlock: `0x${query.fromBlock.toString(16)}`,
+          toBlock: `0x${query.toBlock.toString(16)}`,
+          toAddress: getAddress(query.recipient),
+          contractAddresses: [USDC_CONTRACT_ADDRESS],
+          category: ["erc20"],
+          order: "asc",
+          withMetadata: false,
+          excludeZeroValue: false,
+          maxCount: `0x${TRANSFERS_PAGE_SIZE.toString(16)}`,
+        };
+        if (query.payer !== null) {
+          params["fromAddress"] = getAddress(query.payer);
+        }
+        if (pageKey !== undefined) {
+          params["pageKey"] = pageKey;
+        }
+        let result: unknown;
+        try {
+          result = await client.request({
+            method: "alchemy_getAssetTransfers" as never,
+            params: [params] as never,
+          });
+        } catch (error) {
+          throw toUpstreamError("alchemy_getAssetTransfers", error);
+        }
+        const page = parseAssetTransfersPage(result);
+        for (const transfer of page.transfers) {
+          if (typeof transfer.hash !== "string" || !HASH_32.test(transfer.hash.toLowerCase())) {
+            throw invalidResponse("alchemy_getAssetTransfers", "transfer hash malformed");
+          }
+          hashes.add(transfer.hash.toLowerCase());
+        }
+        if (typeof page.pageKey !== "string") {
+          break;
+        }
+        pageKey = page.pageKey;
       }
-      if (!Array.isArray(logs)) {
-        throw invalidResponse("getLogs", "result is not an array");
+
+      // 2. Verification: canonical receipts, decoded USDC Transfer logs, re-filtered.
+      //    Any failure aborts the whole operation — never a partial result.
+      const ordered = [...hashes];
+      const transfers: ChainTransfer[] = [];
+      for (let index = 0; index < ordered.length; index += RECEIPT_CONCURRENCY) {
+        const batch = ordered.slice(index, index + RECEIPT_CONCURRENCY);
+        const receipts = await Promise.all(
+          batch.map(async (hash) => {
+            try {
+              return await client.getTransactionReceipt({ hash: hash as `0x${string}` });
+            } catch (error) {
+              throw toUpstreamError("getTransactionReceipt", error);
+            }
+          }),
+        );
+        for (const receipt of receipts) {
+          transfers.push(...transfersFromReceipt(receipt, query));
+        }
       }
-      return logs.map((log) => toChainTransfer(log, query));
+
+      // Identity is (txHash, logIndex); a hash discovered twice yields one receipt, but be explicit.
+      const unique = new Map<string, ChainTransfer>();
+      for (const transfer of transfers) {
+        unique.set(`${transfer.txHash}:${transfer.logIndex}`, transfer);
+      }
+      return [...unique.values()];
     },
 
     async getBlockTimestamp(blockNumber: bigint): Promise<Date> {

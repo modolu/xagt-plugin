@@ -146,11 +146,12 @@ access happens on read; reconciliation is a separate, caller-triggered step
 
 ### `POST /v1/payment-intents/:id/reconcile`
 
-Caller-triggered reconciliation. Settle reads the latest Base block, fetches
-native USDC `Transfer` logs from `payer` to `recipient` in
-`[startBlock, latestBlock]`, computes confirmation depth
-(`latest − block + 1`), persists the evidence idempotently and returns the
-updated intent:
+Caller-triggered reconciliation. Settle reads the latest Base block, discovers
+native USDC transfers to `recipient` (from `payer` when declared) in
+`[startBlock, latestBlock]` through the Alchemy Transfers API, verifies each
+one from its canonical transaction receipt (decoded `Transfer` logs — never
+the API's summary values), computes confirmation depth (`latest − block + 1`),
+persists the evidence idempotently and returns the updated intent:
 
 ```sh
 curl -i -X POST https://<deployment>/v1/payment-intents/pi_.../reconcile

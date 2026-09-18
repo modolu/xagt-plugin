@@ -13,7 +13,7 @@
 - **API base URL:** https://settle-beige-seven.vercel.app/v1
 - **Health-check URL:** https://settle-beige-seven.vercel.app/health
 - **Authentication:** none for hackathon v1. Possession of the opaque payment-intent ID (`pi_` + 192 bits of cryptographic randomness) is the capability to read or reconcile that intent; there is no endpoint that lists intents.
-- **Rate limits / known limits:** Vercel Firewall: 60 requests / minute / IP on `/v1/*` (HTTP 429 above that). Request bodies ≤ 16 KiB; intent lifetime ≤ 7 days; `requiredConfirmations` 1–64 (default 3); `externalReference` ≤ 128 characters; evidence pages ≤ 100 rows (cursor pagination). Reconciliation is caller-triggered and typically completes in 1–4 s (one block-number read, one `eth_getLogs` over the intent's window, one block-header read per distinct block). Blockchain-provider failures return `503 UPSTREAM_UNAVAILABLE` (retryable) and never change payment state.
+- **Rate limits / known limits:** Vercel Firewall: 60 requests / minute / IP on `/v1/*` (HTTP 429 above that). Request bodies ≤ 16 KiB; intent lifetime ≤ 7 days; `requiredConfirmations` 1–64 (default 3); `externalReference` ≤ 128 characters; evidence pages ≤ 100 rows (cursor pagination). Reconciliation is caller-triggered and typically completes in 1–5 s (one block-number read, one paginated Alchemy Transfers API discovery over the intent's window, one transaction-receipt read per discovered transaction, one block-header read per distinct block; after expiry, a binary search of block headers resolves the expiry boundary once). Blockchain-provider failures return `503 UPSTREAM_UNAVAILABLE` (retryable) and never change payment state.
 - **API contract:** Documented in `source/README.md` ("Public endpoints") with request/response examples; the stable error envelope is `{"error":{"code","message","retryable"}}` with codes `VALIDATION_ERROR`, `INVALID_ADDRESS`, `UNSUPPORTED_CHAIN`, `UNSUPPORTED_ASSET`, `INTENT_NOT_FOUND`, `RATE_LIMITED`, `UPSTREAM_UNAVAILABLE`, `UPSTREAM_INVALID_RESPONSE`, `INTERNAL_ERROR`.
 
 Endpoints:
@@ -30,7 +30,7 @@ GET  /.well-known/xagent-verification.json
 ## Source and reproducibility
 
 - **Source repository:** https://github.com/modolu/settle
-- **Review commit:** `96194cb3a125bb5ba9063a58e9489167242e193b`
+- **Review commit:** `25e958fcecaeb4ad20760c5a94c93a4670fd2b77`
 - **Source submitted in this PR:** `source/`
 - **Run tests:** `pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm build` (unit, service and jsdom UI tests; no credentials needed). Database integration tests: `TEST_DATABASE_URL=<postgres url> pnpm test tests/integration`. Browser smoke: `pnpm exec playwright install chromium && pnpm test:e2e` (intercepts the API with fixtures; no credentials needed).
 - **Run locally:** `cp .env.example .env.local` (set `DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `ALCHEMY_BASE_RPC_URL`, `XAGENT_SLUG=modolu-settle`), `pnpm db:migrate`, `pnpm dev` → http://localhost:3000. Node.js 24.x, pnpm 10 (pinned via `packageManager`).
@@ -41,12 +41,12 @@ The API must expose:
 
 ```json
 // GET https://settle-beige-seven.vercel.app/health
-{"status":"ok","service":"settle","environment":"production","commit":"96194cb3a125bb5ba9063a58e9489167242e193b","timestamp":"<UTC ISO-8601>"}
+{"status":"ok","service":"settle","environment":"production","commit":"25e958fcecaeb4ad20760c5a94c93a4670fd2b77","timestamp":"<UTC ISO-8601>"}
 ```
 
 ```json
 // GET /.well-known/xagent-verification.json on the same API origin
-{"schemaVersion":1,"slug":"modolu-settle","commit":"96194cb3a125bb5ba9063a58e9489167242e193b"}
+{"schemaVersion":1,"slug":"modolu-settle","commit":"25e958fcecaeb4ad20760c5a94c93a4670fd2b77"}
 ```
 
 ## Verification
@@ -61,7 +61,7 @@ The reproducible call instructions and redacted example responses are in `verifi
 
 - **Data collected:** Per intent: expected amount, recipient address, optional payer address, optional caller-supplied `externalReference` (≤ 128 characters, stored and rendered as plain text), expiry, required confirmations, and the public onchain transfer evidence observed for it (transaction hash, log index, block, sender, recipient, amount, block timestamp). Operational request IDs and reconciliation attempt metadata. No accounts, no personal data fields, no wallet secrets.
 - **Purpose and retention:** Solely to reconcile the declared obligation and return evidence. Data is retained in the Neon database for the life of the hackathon deployment; there is no automatic deletion in v1 (documented limitation).
-- **Third parties / outbound network calls:** Alchemy (Base mainnet JSON-RPC: `eth_blockNumber`, `eth_getLogs`, `eth_getBlockByNumber`), Neon (PostgreSQL), Vercel (hosting, Firewall). The demo UI links to Basescan for transaction/address lookups; no other outbound calls.
+- **Third parties / outbound network calls:** Alchemy (Base mainnet JSON-RPC: `eth_blockNumber`, `alchemy_getAssetTransfers`, `eth_getTransactionReceipt`, `eth_getBlockByNumber`), Neon (PostgreSQL), Vercel (hosting, Firewall). The demo UI links to Basescan for transaction/address lookups; no other outbound calls.
 - **Secrets:** No secrets are committed. Review access is supplied only through an approved private channel when required. The RPC URL and database URLs are server-only environment variables; provider errors are redacted before logging; no `NEXT_PUBLIC_*` secrets exist.
 - **Known risks / restrictions:** Base block-depth confirmations only (no L1 finality model). Reorg handling marks evidence absent from a later complete scan as `orphaned` and recomputes state; a `paid` status can therefore regress if the chain does. Rate limiting is a single 60/min/IP firewall rule on the current Vercel plan. The Vercel-generated production hostname may be replaced by a custom domain later; the version-binding endpoints are relative to whichever origin serves the API.
 

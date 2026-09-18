@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Review commit: `96194cb3a125bb5ba9063a58e9489167242e193b`
+- Review commit: `25e958fcecaeb4ad20760c5a94c93a4670fd2b77`
 - API base URL: `https://settle-beige-seven.vercel.app/v1`
 - Authentication: none. Every call below works anonymously; the only capability is the opaque `pi_…` intent ID returned by the create call, so keep it out of public logs if the intent is real.
 
@@ -17,7 +17,7 @@ curl --fail --silent --show-error https://settle-beige-seven.vercel.app/health
 Expected response (`timestamp` varies):
 
 ```json
-{"status":"ok","service":"settle","environment":"production","commit":"96194cb3a125bb5ba9063a58e9489167242e193b","timestamp":"2026-09-18T12:00:00.000Z"}
+{"status":"ok","service":"settle","environment":"production","commit":"25e958fcecaeb4ad20760c5a94c93a4670fd2b77","timestamp":"2026-09-18T12:00:00.000Z"}
 ```
 
 ## 2. Deployment proof
@@ -29,7 +29,7 @@ curl --fail --silent --show-error https://settle-beige-seven.vercel.app/.well-kn
 Expected response:
 
 ```json
-{"schemaVersion":1,"slug":"modolu-settle","commit":"96194cb3a125bb5ba9063a58e9489167242e193b"}
+{"schemaVersion":1,"slug":"modolu-settle","commit":"25e958fcecaeb4ad20760c5a94c93a4670fd2b77"}
 ```
 
 The `commit` values in steps 1 and 2 are the same platform-provided value; if either is unavailable the route answers `500 {"error":{"code":"INTERNAL_ERROR",…}}` rather than a fabricated commit.
@@ -79,7 +79,7 @@ curl --fail --silent --show-error --request POST \
   https://settle-beige-seven.vercel.app/v1/payment-intents/<id>/reconcile
 ```
 
-Settle reads the latest Base block, queries native-USDC `Transfer` logs from the payer to the recipient inside the window, computes confirmation depth (`latest − block + 1`), applies the evidence atomically and returns the updated resource. With no payment sent, the response is the intent with `"status":"pending"`; after a matching transfer it becomes `detected` (under the confirmation threshold), then `paid` (or `partial` / `overpaid`), with `receivedAmount`, `remainingAmount`, `matchConfidence` and `paidAt` filled from onchain evidence. Repeated calls are idempotent: evidence is keyed by `(transaction hash, log index)` and totals are recomputed, never incremented.
+Settle reads the latest Base block, discovers native-USDC transfers to the recipient (from the payer) inside the window through the Alchemy Transfers API, verifies each from its canonical transaction receipt (decoded `Transfer` logs), computes confirmation depth (`latest − block + 1`), applies the evidence atomically and returns the updated resource. With no payment sent, the response is the intent with `"status":"pending"`; after a matching transfer it becomes `detected` (under the confirmation threshold), then `paid` (or `partial` / `overpaid`), with `receivedAmount`, `remainingAmount`, `matchConfidence` and `paidAt` filled from onchain evidence. Repeated calls are idempotent: evidence is keyed by `(transaction hash, log index)` and totals are recomputed, never incremented.
 
 ### 3d. Evidence
 
